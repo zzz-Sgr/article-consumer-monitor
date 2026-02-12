@@ -1,0 +1,12 @@
+# 邮件服务器的SMTP地址
+host = smtp.qq.com
+# 端口
+port = 465
+# 发件人（必须是你自己的邮箱）
+from =
+# 用户名
+user =
+# 密码（授权码）
+pass =
+# 使用SSL
+sslEnable = true
