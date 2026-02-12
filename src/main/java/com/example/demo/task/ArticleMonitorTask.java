@@ -1,7 +1,6 @@
 package com.example.demo.task;
 
 import cn.hutool.core.collection.CollUtil;
-import cn.hutool.core.util.RuntimeUtil;
 import cn.hutool.extra.mail.MailUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,11 +19,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * @description: 综合监控任务：生产环境最终优化版
- * @author: admin
- * @date: 2026-02-11
+ * 文章消费监控核心任务
+ * 遵循阿里巴巴 Java 开发手册规范
+ *
+ * @author admin
+ * @date 2026-02-12
  */
-
 @Component
 @Slf4j
 public class ArticleMonitorTask {
@@ -32,246 +32,242 @@ public class ArticleMonitorTask {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    // --- 环境配置注入 ---
+
     @Value("${monitor.alarm.email-to}")
     private String targetEmail;
 
     @Value("${monitor.server.ip}")
     private String serverIp;
 
-    @Value("${monitor.server.port}")
-    private int serverPort;
+    @Value("${monitor.server.ports}")
+    private String serverPorts;
 
     @Value("${monitor.kafka.script-path}")
     private String kafkaScriptPath;
 
-    // [优化 2] 提取基准 ID 到配置文件
-    @Value("${monitor.source.base-id}")
-    private int baseSourceId;
+    // --- 静态常量 (Static Constants) ---
 
-    // --- 常量定义 ---
+    /** SQL查询中：标识资源链接长度超限的错误消息文本 */
     private static final String ERR_MSG_LINK_TOO_LONG = "资源链接超过字段长度：8255";
-    private static final int DATA_STOP_THRESHOLD_HOURS = 8;
-    private static final int PORT_ALARM_DAILY_LIMIT = 2;
-    // private static final int BASE_SOURCE_ID = 334; // 已移除硬编码
 
+    /** 数据断流告警阈值：连续 N 小时无数据则触发告警 */
+    private static final int DATA_STOP_THRESHOLD_HOURS = 8;
+
+    /** 每日端口异常邮件发送次数上限，防止邮件轰炸 */
+    private static final int PORT_ALARM_DAILY_LIMIT = 2;
+
+    /** 网络探测超时时间（单位：毫秒） */
+    private static final int SOCKET_TIMEOUT_MS = 3000;
+
+    /** 失败告警阶梯：第一级（一般严重） */
     private static final int FAIL_LEVEL_L1 = 20;
+
+    /** 失败告警阶梯：第二级（高度严重） */
     private static final int FAIL_LEVEL_L2 = 50;
+
+    /** 失败告警阶梯：第三级（灾难级别） */
     private static final int FAIL_LEVEL_L3 = 100;
 
-    // --- 状态变量 ---
+    // --- 内部变量 (Instance/Static Variables) ---
+
+    /** 最后一次从数据库中检测到新记录的时间 */
     private LocalDateTime lastSeenDataTime;
+
+    /** 记录当日已发送的端口告警邮件次数 */
     private int dailyPortAlarmCount = 0;
+
+    /** 记录当日已触发的最高告警级别，避免重复发送同级别的低阶告警 */
     private int lastReportedLevel = 0;
 
-    /**
-     * 初始化最后入库时间
+    /** * 增量监控的基准 ID。
+     * 使用 volatile 关键字确保在多线程定时任务中的可见性。
+     * 初始为 null，由任务逻辑自动完成初始化。
      */
+    private volatile Long currentBaseId = null;
+
     @PostConstruct
-    public void initLastSeenTime() {
-        try {
-            String sql = "SELECT MAX(createTime) FROM article";
-            LocalDateTime lastTime = jdbcTemplate.queryForObject(sql, LocalDateTime.class);
-            this.lastSeenDataTime = (lastTime != null) ? lastTime : LocalDateTime.now();
-            log.info(">>>> [系统初始化] 成功获取最后入库时间: {}, 服务器: {}", lastSeenDataTime, serverIp);
-        } catch (Exception e) {
-            this.lastSeenDataTime = LocalDateTime.now();
-            log.warn(">>>> [系统初始化] 无法获取最后入库时间。");
-        }
+    public void init() {
+        this.lastSeenDataTime = LocalDateTime.now();
+        log.info(">>>> [服务启动] 监控任务已就绪，当前目标服务器: {}", serverIp);
     }
 
     /**
-     * 需求 4: 数据流断流监测
-     * [优化 3] 提高检测频率：改为每 30 分钟执行一次，SQL 依然查过去 1 小时。
-     * 这样可以更敏锐地发现断流（最快断流 30 分钟后就能发现，而不是 1 小时）。
+     * 需求 5 优化：增量信源明细推送
+     * 采用“懒加载”初始化 ID，若 currentBaseId 为空则先查询库内最大值
      */
-    @Scheduled(cron = "0 0/30 * * * ?") // 修改为：每30分钟执行
-    public void monitorDataFlow() {
+    @Scheduled(cron = "0 0 9 * * ?")
+    public void pushNewSourcesDetail() {
         try {
-            String sql = "SELECT COUNT(*) FROM article WHERE createTime >= DATE_SUB(NOW(), INTERVAL 1 HOUR)";
-            Integer recordCount = jdbcTemplate.queryForObject(sql, Integer.class);
+            // 1. 初始化检查：如果从未运行过，先获取库内当前最大ID作为起点
+            if (currentBaseId == null) {
+                String maxIdSql = "SELECT MAX(id) FROM trs_datasource";
+                Long maxId = jdbcTemplate.queryForObject(maxIdSql, Long.class);
+                currentBaseId = (maxId != null) ? maxId : 0L;
+                log.info(">>>> [基准初始化] 获取当前数据库最大 ID 为: {}，从下一次循环开始监控增量。", currentBaseId);
+                return;
+            }
 
-            if (recordCount != null && recordCount > 0) {
-                lastSeenDataTime = LocalDateTime.now();
-                log.info(">>>> [正常] 数据流正常。服务器: {}, 过去1小时入库数: {}", serverIp, recordCount);
+            // 2. 增量查询：查询 ID 大于基准且为昨日创建的数据
+            String sql = "SELECT * FROM trs_datasource WHERE id > ? AND createTime >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) ORDER BY id DESC";
+            List<Map<String, Object>> newSources = jdbcTemplate.queryForList(sql, currentBaseId);
+
+            // 无论是否有新数据，9点钟都可以通过 buildAndSendSourceEmail 发送“体检报告”
+            // 如果你希望只有在有新数据时才发，可以保留这个 if 判断
+            if (CollUtil.isNotEmpty(newSources)) {
+                // 3. 构造邮件并发送
+                buildAndSendSourceEmail(newSources);
+
+                // 4. 更新基准 ID 为本次探测到的最新（最大）ID
+                currentBaseId = Long.parseLong(newSources.get(0).get("id").toString());
+                log.info(">>>> [增量监控] 发现 {} 条新信源，基准 ID 更新至: {}", newSources.size(), currentBaseId);
             } else {
-                long hoursOffline = Duration.between(lastSeenDataTime, LocalDateTime.now()).toHours();
-                if (hoursOffline >= DATA_STOP_THRESHOLD_HOURS) {
-                    sendEmailAlarm("数据流断流严重告警", "服务器 " + serverIp + " 的 article 表已连续 " + hoursOffline + " 小时无新数据。");
-                } else {
-                    log.warn(">>>> [预警阶段] 监测到数据流中断。当前累计断流: {} 小时", hoursOffline);
-                }
+                log.info(">>>> [常规巡检] 昨日无新增信源 (BaseID: {})", currentBaseId);
             }
         } catch (Exception e) {
-            log.error(">>>> [执行异常] 数据流监测方法失败。", e);
+            log.error(">>>> [任务异常] 信源推送任务执行失败", e);
         }
     }
 
     /**
-     * 需求 5: 端口连接探测 (每 10 分钟)
+     * 需求 6 优化：多端口连接探测
+     * 监控 Kafka(9092)、数据接收(9100)、消费服务(10086)
      */
-    @Scheduled(cron = "0 0/10 * * * ?") // 生产配置：每10分钟执行
-    public void monitorServerPortConnection() {
+    @Scheduled(cron = "0 0/10 * * * ?")
+    public void monitorServerPorts() {
         if (dailyPortAlarmCount >= PORT_ALARM_DAILY_LIMIT) return;
 
-        boolean portOk = false;
-        String os = System.getProperty("os.name").toLowerCase();
+        String[] ports = serverPorts.split(",");
+        StringBuilder errorMsg = new StringBuilder();
+        boolean hasError = false;
 
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(serverIp, serverPort), 3000);
-            portOk = true;
-            log.info(">>>> [监测正常] 端口连通性测试通过: {}:{}", serverIp, serverPort);
-        } catch (IOException e) {
-            log.warn(">>>> [监测异常] 端口无法连接: {}", e.getMessage());
-        }
-
-        // 只有 Linux 环境才深入检查进程
-        if (portOk && os.contains("linux")) {
-            String psResult = RuntimeUtil.execForStr("ps -ef | grep article | grep -v grep");
-            String kafkaCmd = "sh " + kafkaScriptPath + " --bootstrap-server localhost:9092 --describe --group my-group";
-            String kafkaResult = RuntimeUtil.execForStr(kafkaCmd);
-
-            if (psResult.isEmpty() || kafkaResult.contains("error")) {
-                portOk = false;
-                log.error(">>>> [服务器异常] 进程或 Kafka 状态不符预期");
+        for (String portStr : ports) {
+            int port = Integer.parseInt(portStr.trim());
+            // 使用 try-with-resources 自动管理资源
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(serverIp, port), SOCKET_TIMEOUT_MS);
+            } catch (IOException e) {
+                hasError = true;
+                errorMsg.append("端口 ").append(port).append(" 连通失败; ");
             }
         }
 
-        if (!portOk) {
-            sendEmailAlarm("监控状态异常", "服务器 " + serverIp + " 状态异常，请核查。");
+        if (hasError) {
+            log.error(">>>> [端口报警] 发现异常端口：{}", errorMsg);
+            sendEmailAlarm("服务器端口连通性异常告警", "服务器 " + serverIp + " 探测结果: " + errorMsg);
             dailyPortAlarmCount++;
         }
     }
 
     /**
-     * 需求 6: 每日新增信源明细推送 (每天 09:00)
-     * [优化 1] 统计范围改为“昨天全天”，确保 00:00~23:59 的数据不遗漏。
+     * 数据流断流监测
      */
-    @Scheduled(cron = "0 0 9 * * ?") // 生产配置：每天09:00执行
-    public void pushNewSourcesDetail() {
-        log.info(">>>> [常规任务] 正在推送昨日新增信源明细。服务器: {}", serverIp);
+    @Scheduled(cron = "0 0/30 * * * ?")
+    public void monitorDataFlow() {
         try {
-            // [优化 1] SQL 修改：查询昨天全天的数据 ( >= 昨天0点 AND < 今天0点 )
-            String sql = "SELECT * FROM trs_datasource WHERE id > ? AND createTime >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND createTime < CURDATE() ORDER BY id DESC";
+            String sql = "SELECT COUNT(*) FROM article WHERE createTime >= DATE_SUB(NOW(), INTERVAL 1 HOUR)";
+            Integer count = jdbcTemplate.queryForObject(sql, Integer.class);
 
-            // [优化 2] 使用配置注入的 baseSourceId
-            List<Map<String, Object>> newSources = jdbcTemplate.queryForList(sql, baseSourceId);
-
-            if (CollUtil.isNotEmpty(newSources)) {
-                StringBuilder htmlBody = new StringBuilder("<h3>昨日新增信源明细报告</h3>") // 标题修改为“昨日”
-                        .append("<p>统计范围：昨日全天 (00:00 - 23:59)</p>")
-                        .append("<table border='1' cellspacing='0' cellpadding='5'>")
-                        .append("<tr bgcolor='#f2f2f2'><th>ID</th><th>信源名称</th><th>数据摘要</th></tr>");
-
-                for (Map<String, Object> source : newSources) {
-                    htmlBody.append("<tr>")
-                            .append("<td>").append(source.get("id")).append("</td>")
-                            .append("<td>").append(source.get("source_name")).append("</td>")
-                            .append("<td>").append(source.toString()).append("</td>")
-                            .append("</tr>");
-                }
-                htmlBody.append("</table>");
-                sendEmailAlarm("昨日新信源推送报告", htmlBody.toString()); // 邮件标题也改为“昨日”
+            if (count != null && count > 0) {
+                lastSeenDataTime = LocalDateTime.now();
             } else {
-                log.info(">>>> [任务成功] 昨日无新信源。");
+                long hours = Duration.between(lastSeenDataTime, LocalDateTime.now()).toHours();
+                if (hours >= DATA_STOP_THRESHOLD_HOURS) {
+                    sendEmailAlarm("数据流断流警告", "服务器 " + serverIp + " 已连续 " + hours + " 小时无新数据入库。");
+                }
             }
         } catch (Exception e) {
-            log.error(">>>> [任务异常] 信源推送失败。", e);
+            log.error(">>>> [异常] 数据流监控失败", e);
         }
     }
 
     /**
-     * 需求 7: 失败数量阶梯告警 (每 30 分钟)
+     * 阶梯告警逻辑
      */
-    @Scheduled(cron = "0 0/30 * * * ?") // 生产配置：每30分钟执行
+    @Scheduled(cron = "0 0/30 * * * ?")
     public void monitorFailureRate() {
         try {
-            // 生产 SQL：必须查失败条件
             String sql = "SELECT COUNT(*) FROM article WHERE createTime >= CURDATE() AND isVideoTranscod = 3 AND resourceUrl != ?";
             Integer failCount = jdbcTemplate.queryForObject(sql, Integer.class, ERR_MSG_LINK_TOO_LONG);
 
             if (failCount != null) {
-                int currentLevel = 0;
-                if (failCount >= FAIL_LEVEL_L3) currentLevel = 3;
-                else if (failCount >= FAIL_LEVEL_L2) currentLevel = 2;
-                else if (failCount >= FAIL_LEVEL_L1) currentLevel = 1;
+                int level = 0;
+                if (failCount >= FAIL_LEVEL_L3) level = 3;
+                else if (failCount >= FAIL_LEVEL_L2) level = 2;
+                else if (failCount >= FAIL_LEVEL_L1) level = 1;
 
-                if (currentLevel > lastReportedLevel) {
-                    String title = "入库失败告警 (L" + currentLevel + ")";
-                    String content = "服务器: " + serverIp + "\n今日累计入库失败数已达: " + failCount + " 次。";
-
-                    if (currentLevel == 3) {
-                        title = "系统严重报错 (L3)";
-                        content += "\n请立即排查资源及服务状态！";
-                    }
-
-                    sendEmailAlarm(title, content);
-                    lastReportedLevel = currentLevel;
-                    log.info(">>>> [告警触发] 已发送 {} 级告警，当前失败数: {}", currentLevel, failCount);
+                if (level > lastReportedLevel) {
+                    sendEmailAlarm("入库失败阶梯告警(L" + level + ")", "今日累计失败: " + failCount);
+                    lastReportedLevel = level;
                 }
             }
         } catch (Exception e) {
-            log.error(">>>> [统计异常] 失败率任务失败。", e);
+            log.error(">>>> [异常] 失败率监控失败", e);
         }
     }
 
-    /**
-     * 需求 8: 每日 08:50 定时发送健康检查报告
-     */
-    @Scheduled(cron = "0 50 8 * * ?") // 生产配置：每天08:50执行
-    public void dailyHealthReport() {
-        log.info(">>>> [常规任务] 开始生成每日健康检查报告。");
-
-        String os = System.getProperty("os.name").toLowerCase();
-        // 生产环境：非 Linux 直接跳过，避免报错
-        if (!os.contains("linux")) {
-            log.warn(">>>> [任务取消] 非 Linux 环境，跳过健康报告。");
-            return;
-        }
-
-        String psResult = RuntimeUtil.execForStr("ps -ef | grep article | grep -v grep");
-        if (psResult.isEmpty()) {
-            psResult = "警告：未找到相关 article 进程！";
-        }
-
-        String kafkaCmd = "sh " + kafkaScriptPath + " --bootstrap-server localhost:9092 --describe --group my-group";
-        String kafkaResult = RuntimeUtil.execForStr(kafkaCmd);
-        if (kafkaResult.isEmpty() || kafkaResult.contains("error")) {
-            kafkaResult = "错误：无法获取 Kafka 状态，请检查服务及脚本路径。";
-        }
-
-        StringBuilder htmlBody = new StringBuilder("<h2>每日系统健康巡检报告 (08:50)</h2>")
-                .append("<p><b>服务器 IP:</b> ").append(serverIp).append("</p>")
-                .append("<hr/>")
-                .append("<h3>1. Java 进程状态 (ps -ef | grep article)</h3>")
-                .append("<pre style='background:#f4f4f4;padding:10px;'>").append(psResult).append("</pre>")
-                .append("<hr/>")
-                .append("<h3>2. Kafka 消费组详情 (my-group)</h3>")
-                .append("<pre style='background:#f4f4f4;padding:10px;'>").append(kafkaResult).append("</pre>")
-                .append("<br/><p><i>注：此邮件为每日定时巡检。若运行期间进程异常中断，系统将触发实时告警。</i></p>");
-
-        sendEmailAlarm("每日健康巡检报告", htmlBody.toString());
-        log.info(">>>> [任务成功] 每日健康报告已发送至: {}", targetEmail);
-    }
-
-    /**
-     * 每日重置计数器
-     */
     @Scheduled(cron = "0 0 0 * * ?")
     public void resetDailyCounters() {
         dailyPortAlarmCount = 0;
         lastReportedLevel = 0;
-        log.info(">>>> [系统维护] 每日计数器及阶梯等级已重置。");
+        log.info(">>>> [系统维护] 每日告警计数器已重置。");
+    }
+
+    /**
+     * 构建综合体检报告邮件
+     */
+    private void buildAndSendSourceEmail(List<Map<String, Object>> data) {
+        StringBuilder body = new StringBuilder();
+
+        // 1. 添加服务器健康状态板块
+        body.append("<h2>核心服务端口体检报告</h2>");
+        body.append("<table border='1' cellspacing='0' cellpadding='5' style='border-collapse: collapse;'>");
+        body.append("<tr style='background-color: #f2f2f2;'><th>服务名称</th><th>端口</th><th>状态</th></tr>");
+
+        // 检查 9100 和 10086 两个核心端口
+        body.append(formatPortStatusRow("TRS数据接收服务", 9100));
+        body.append(formatPortStatusRow("文章消费服务", 10086));
+        body.append("</table>");
+
+        body.append("<br/><hr/><br/>");
+
+        // 2. 添加新增信源明细板块
+        body.append("<h2>昨日新增信源明细</h2>");
+        body.append("<table border='1' cellspacing='0' cellpadding='5' style='border-collapse: collapse;'>");
+        body.append("<tr style='background-color: #f2f2f2;'><th>ID</th><th>信源名称</th></tr>");
+        for (Map<String, Object> row : data) {
+            body.append("<tr><td>").append(row.get("id")).append("</td><td>").append(row.get("source_name")).append("</td></tr>");
+        }
+        body.append("</table>");
+
+        sendEmailAlarm("每日文章消费综合体检报告", body.toString());
+    }
+
+    /**
+     * 检测单个端口状态并格式化为 HTML 行
+     */
+    private String formatPortStatusRow(String serviceName, int port) {
+        String status;
+        String color;
+
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(serverIp, port), SOCKET_TIMEOUT_MS);
+            status = "正常 (Running)";
+            color = "green";
+        } catch (IOException e) {
+            status = "异常 (Connection Failed)";
+            color = "red";
+        }
+
+        return String.format("<tr><td>%s</td><td>%d</td><td style='color: %s; font-weight: bold;'>%s</td></tr>",
+                serviceName, port, color, status);
     }
 
     private void sendEmailAlarm(String title, String content) {
         try {
-            List<String> tos = cn.hutool.core.text.CharSequenceUtil.split(targetEmail, ',');
-            if (CollUtil.isNotEmpty(tos)) {
-                MailUtil.send(tos, title, content, true);
-                log.info(">>>> [邮件发送成功] 标题: {}, 收件人数量: {}", title, tos.size());
-            }
+            MailUtil.send(targetEmail, title, content, true);
         } catch (Exception e) {
-            log.error(">>>> [邮件发送失败] 请检查网络或 mail.setting 配置。", e);
+            log.error(">>>> [邮件失败] 标题: {}", title);
         }
     }
 }

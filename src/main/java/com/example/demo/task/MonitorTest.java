@@ -5,6 +5,6 @@ package com.example.demo.task;
  * @author: admin
  * @date: 2026/2/10 上午9:42
  */
-public class MinitorTest {
+public class MonitorTest {
 }
 

@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: article-consumer-monitor
+  task:
+    scheduling:
+      pool:
+        size: 5
+  profiles:
+    # 修改这里切换环境：dev (开发) / prod (生产)
+    active: dev
