@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    # 开发环境数据库
+    url:
+    username:
+    password:
+
+monitor:
+  server:
+    ip: 127.0.0.1
+    # 开发环境测试端口
+    ports: 3306
+  kafka:
+    script-path:
+  alarm:
+    email-to:
