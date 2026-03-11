@@ -20,7 +20,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture; // 关键包：已解决无法解析符号的问题
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -30,8 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 包含增量信源监控、指定端口健康容灾检查、断流及失败率预警。
  * * 已引入并发安全的 Atomic 原子类彻底解决多线程调度下的并发写问题。
  *
- * @author Gemini Expert
- * @version 6.0 (配置全面外置 + 多线程并发安全 + 全量运行日志终极版)
+ * @version 7.0 (全量任务执行结果日志回显版，正常打日志，异常才发邮件)
  */
 @Component
 @Slf4j
@@ -125,9 +124,6 @@ public class ArticleMonitorTask {
         });
     }
 
-    /**
-     * 新增私有方法：仅用于启动时的强制检测并打印详细日志
-     */
     private void runInitialPortCheck() {
         String[] portsArray = serverPorts.split(",");
         for (String p : portsArray) {
@@ -141,9 +137,6 @@ public class ArticleMonitorTask {
         }
     }
 
-    /**
-     * 内部方法：初始化基准 ID。如果为 null，则从数据库读取当前最大值
-     */
     private void initBaseIdIfNull() {
         if (currentBaseId == null) {
             try {
@@ -162,7 +155,8 @@ public class ArticleMonitorTask {
      */
     @Scheduled(cron = "0 0/30 * * * ?")
     public void monitorNewSources() {
-        initBaseIdIfNull(); // 兜底校验
+        initBaseIdIfNull();
+        log.info(">>>> [Task_Start] 开始执行增量信源检查...");
 
         try {
             String sql = "SELECT id, mediaName FROM trs_datasource WHERE id > ? ORDER BY id DESC";
@@ -175,31 +169,32 @@ public class ArticleMonitorTask {
                             .append(" | 名称: ").append(source.get("mediaName")).append("<br/>");
                 }
 
+                log.warn("⚠️ [Check_Result] 发现 {} 个新信源，准备发送告警邮件...", newSources.size());
                 sendEmailAlarm("【通知】系统新增信源告警", content.toString());
 
-                // 更新最大基准值
                 currentBaseId = Long.parseLong(newSources.get(0).get("id").toString());
-                log.info(">>>> [BaseId_Update] 发现新信源，基准ID已更新至: {}", currentBaseId);
+                log.info(">>>> [BaseId_Update] 基准ID已更新至: {}", currentBaseId);
+            } else {
+                // --- 新增：正常状态回显 ---
+                log.info("✅ [Check_Result] 增量信源检查完毕: 未发现新信源, 当前 BaseId 维持在 {}", currentBaseId);
             }
         } catch (Exception e) {
-            log.error(">>>> [Source_Monitor_Error] 增量信源检查失败", e);
+            log.error("❌ [Source_Monitor_Error] 增量信源检查失败", e);
         }
     }
 
     /**
-     * 2. 多端口连接探测 (修改点：新增每次执行的全量结果回显日志)
+     * 2. 多端口连接探测
      */
     @Scheduled(fixedRate = 300000)
     public void monitorServerPorts() {
         log.info(">>>> [Heartbeat] 开始执行端口健康检查任务...");
 
-        // 使用 .get() 获取原子类的值
         if (dailyPortAlarmCount.get() >= portAlarmDailyLimit) {
             log.warn(">>>> [Skip] 端口告警已达今日上限，跳过探测.");
             return;
         }
 
-        // 解析动态端口配置
         String[] portsArray = serverPorts.split(",");
         int portKafka = Integer.parseInt(portsArray[0].trim());
         int portTrs = Integer.parseInt(portsArray[1].trim());
@@ -209,31 +204,20 @@ public class ArticleMonitorTask {
         boolean trsOk = checkPortOpen(portTrs);
         boolean consumerOk = checkPortOpen(portConsumer);
 
-        // 收集正常端口，用于日志回显
         List<String> success = new ArrayList<>();
         if (kafkaOk) success.add(String.valueOf(portKafka));
         if (trsOk) success.add(String.valueOf(portTrs));
         if (consumerOk) success.add(String.valueOf(portConsumer));
 
-        // 收集异常逻辑
         List<String> errors = new ArrayList<>();
-        if (!kafkaOk) {
-            errors.add("Kafka服务 (" + portKafka + ") 失联");
-        }
-        if (!trsOk && !consumerOk) {
-            errors.add("数据流服务容灾链路异常 (TRS " + portTrs + " 与 消费端 " + portConsumer + " 均无法连接)");
-        }
+        if (!kafkaOk) errors.add("Kafka服务 (" + portKafka + ") 失联");
+        if (!trsOk && !consumerOk) errors.add("数据流服务容灾链路异常 (TRS " + portTrs + " 与 消费端 " + portConsumer + " 均无法连接)");
 
-        // --- 核心修改：无论成功失败，每次探测都打印出结果 ---
         if (errors.isEmpty()) {
             log.info("✅ [Check_Result] 端口健康检查通过! 正常状态端口: [{}]", String.join(", ", success));
         } else {
             log.warn("⚠️ [Check_Result] 端口健康检查异常! 正常: [{}], 告警内容: {}", String.join(", ", success), errors);
-        }
-
-        if (!errors.isEmpty()) {
             sendEmailAlarm("【紧急】核心服务端口异常", "检测到以下故障: <br/>" + String.join("<br/>", errors));
-            // 使用 .incrementAndGet() 进行并发安全的自增
             dailyPortAlarmCount.incrementAndGet();
         }
     }
@@ -243,6 +227,7 @@ public class ArticleMonitorTask {
      */
     @Scheduled(cron = "0 0/30 * * * ?")
     public void monitorDataFlow() {
+        log.info(">>>> [Task_Start] 开始执行数据流断流监测...");
         try {
             LocalDateTime oneHourAgo = LocalDateTime.now().minusHours(1);
             String sql = "SELECT COUNT(*) FROM article WHERE createTime >= ?";
@@ -250,26 +235,26 @@ public class ArticleMonitorTask {
 
             if (count != null && count > 0) {
                 lastSeenDataTime = LocalDateTime.now();
-                // 使用 .get() 判断状态
                 if (isDataFlowAlarmed.get()) {
-                    // 使用 .set() 赋值
                     isDataFlowAlarmed.set(false);
-                    log.info(">>>> [DataFlow] 数据恢复入库，解除断流锁定");
+                    log.info("✅ [Check_Result] 数据恢复入库，解除断流锁定。最近1小时入库量: {}", count);
+                } else {
+                    // --- 新增：正常状态回显 ---
+                    log.info("✅ [Check_Result] 数据流活性正常: 最近1小时内有 {} 条新数据入库", count);
                 }
             } else {
                 long hours = Duration.between(lastSeenDataTime, LocalDateTime.now()).toHours();
-                // 使用 yml 注入的断流时间阈值
+                log.warn("⚠️ [Check_Result] 数据流异常: 已连续 {} 小时无新数据入库", hours);
+
                 if (hours >= dataStopThresholdHours) {
-                    // 使用 .get() 判断非状态
                     if (!isDataFlowAlarmed.get()) {
                         sendEmailAlarm("【警告】数据断流预警", "服务器 " + serverIp + " 已连续 " + hours + " 小时无新数据入库。");
-                        // 使用 .set() 赋值上锁
                         isDataFlowAlarmed.set(true);
                     }
                 }
             }
         } catch (Exception e) {
-            log.error(">>>> [DataFlow_Error] 活性检测失败", e);
+            log.error("❌ [DataFlow_Error] 活性检测失败", e);
         }
     }
 
@@ -278,23 +263,25 @@ public class ArticleMonitorTask {
      */
     @Scheduled(cron = "0 0/30 * * * ?")
     public void monitorFailureRate() {
+        log.info(">>>> [Task_Start] 开始统计入库失败率...");
         try {
             String sql = "SELECT COUNT(*) FROM article WHERE createTime >= CURDATE() AND isVideoTranscod = 3 AND resourceUrl != ?";
             Integer failCount = jdbcTemplate.queryForObject(sql, Integer.class, ERR_MSG_LINK_TOO_LONG);
 
             if (failCount != null) {
-                // 使用 yml 注入的阶梯阈值
+                // --- 新增：正常状态回显 ---
+                log.info("✅ [Check_Result] 失败率统计完成: 今日累计超长异常失败 {} 条", failCount);
+
                 int level = (failCount >= failLevelL3) ? 3 : (failCount >= failLevelL2 ? 2 : (failCount >= failLevelL1 ? 1 : 0));
 
-                // 使用 .get() 进行比较
                 if (level > lastReportedLevel.get()) {
+                    log.warn("⚠️ [FailRate_Alarm] 失败率跨越阈值，触发 L{} 级别告警邮件!", level);
                     sendEmailAlarm("【告警升级】入库失败率达到 L" + level, "今日累计失败已达: " + failCount + " 条。");
-                    // 使用 .set() 更新级别
                     lastReportedLevel.set(level);
                 }
             }
         } catch (Exception e) {
-            log.error(">>>> [FailureRate_Error] 统计失败", e);
+            log.error("❌ [FailureRate_Error] 统计失败", e);
         }
     }
 
@@ -305,21 +292,24 @@ public class ArticleMonitorTask {
     public void monitorKafkaHealth() {
         if (StrUtil.isBlank(kafkaScriptPath)) return;
 
+        log.info(">>>> [Task_Start] 开始调用 Kafka 健康监测脚本...");
+
         try {
             String result = RuntimeUtil.execForStr(kafkaScriptPath);
             if (StrUtil.containsAnyIgnoreCase(result, "Exception", "Error", "fail")) {
-                // 使用 .get() 获取数字比较
+                log.warn("⚠️ [Check_Result] Kafka脚本执行异常，发现错误关键字！");
                 if (dailyKafkaAlarmCount.get() < kafkaAlarmDailyLimit) {
                     sendEmailAlarm("【异常】Kafka 监控脚本错误", "执行返回异常信息:<br/>" + result);
-                    // 使用 .incrementAndGet() 进行并发安全自增
                     dailyKafkaAlarmCount.incrementAndGet();
                 }
+            } else {
+                // --- 新增：正常状态回显 ---
+                log.info("✅ [Check_Result] Kafka脚本监控通过: 状态正常");
             }
         } catch (Exception e) {
-            // 使用 .get() 获取数字比较
+            log.error("❌ [Check_Result] Kafka脚本执行彻底失败: {}", e.getMessage());
             if (dailyKafkaAlarmCount.get() < kafkaAlarmDailyLimit) {
                 sendEmailAlarm("【错误】Kafka 脚本执行失败", "路径: " + kafkaScriptPath + "<br/>异常: " + e.getMessage());
-                // 使用 .incrementAndGet() 进行并发安全自增
                 dailyKafkaAlarmCount.incrementAndGet();
             }
         }
@@ -330,14 +320,13 @@ public class ArticleMonitorTask {
      */
     @Scheduled(cron = "0 0 0 * * ?")
     public void resetDailyCounters() {
-        // 全部使用 .set() 方法归零/复位，彻底解决多线程不安全问题
         dailyPortAlarmCount.set(0);
         lastReportedLevel.set(0);
         isDataFlowAlarmed.set(false);
         dailyKafkaAlarmCount.set(0);
 
         initBaseIdIfNull();
-        log.info(">>>> [Maintenance_Reset] 零点计数器重置完成。");
+        log.info(">>>> [Maintenance_Reset] 零点计数器及状态锁重置完成。");
     }
 
     // =========================================================================
