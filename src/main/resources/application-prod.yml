@@ -3,9 +3,10 @@ server:
 
 spring:
   datasource:
-    url: jdbc:mysql://10.17.38.203:3306/trsspider?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8
-    username: trsspider
-    password: gzXd7a3vguFkM94JoPS7
+    # 脱敏：去掉真实的 IP、用户名和密码
+    url: jdbc:mysql://127.0.0.1:3306/your_database_name?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8
+    username: your_username
+    password: your_password
 
 monitor:
   server:
@@ -13,9 +14,9 @@ monitor:
     # 需求 6 要求的监控端口列表
     ports: 9092,9100,10087
   kafka:
-    script-path: "/data/TRS/kafka_2.13-2.8.0/bin/kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9092 --list"
+    script-path: /path/to/your/kafka-check.sh
   alarm:
-    email-to: 735543130@qq.com,1584521716@qq.com
+    email-to: example1@domain.com,example2@domain.com
     daily-limit:
       port: 5    # 新增：端口告警每天上限
       kafka: 3   # 新增：Kafka告警每天上限
