@@ -1,20 +1,20 @@
 spring:
   datasource:
     # 开发环境数据库
-    url: jdbc:mysql://124.70.94.151:3306/trsspider?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8
-    username: trsspider
-    password: gzXd7a3vguFkM94JoPS7
+    url: jdbc:mysql://127.0.0.1:3306/your_database_name?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8
+    username: your_username
+    password: your_password
 
 monitor:
   server:
     ip: 127.0.0.1
     # 开发环境测试端口
     ports: 3306,3306,3306
-  kafka:
-    script-path: D:/temp/kafka-check.sh
+    # 脱敏：可以用一个通用的路径替代你们公司真实的路径
+    script-path: /path/to/your/kafka-check.sh
   alarm:
-    email-to: 735543130@qq.com
-    # ⬇️ 必须新增以下内容，否则程序无法启动 ⬇️
+    email-to: example1@domain.com,example2@domain.com
+
     daily-limit:
       port: 5
       kafka: 3
