@@ -1,5 +1,6 @@
 HELP.md
 target/
+*.class
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
@@ -39,3 +40,11 @@ Thumbs.db
 ### Log ###
 *.log
 logs/
+log/
+nohup.out
+
+### 敏感配置文件 (可选) ###
+# 如果您不想把包含真实密码的配置文件传到 GitHub，可以取消下面三行的注释：
+# src/main/resources/application-prod.yml
+# src/main/resources/application-dev.yml
+# src/main/resources/mail.setting
